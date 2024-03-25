@@ -1,0 +1,324 @@
+#!/bin/bash
+
+# ---------- Variables ----------
+
+directories=()
+output_dir=""
+log_file="/var/log/backup.log"
+tmp_error_file=("/tmp/backup_error")
+compression="gz"
+encrypt=false
+remove_after_backup=false
+just_copy=false
+num_cores=1
+encryption_key=""
+
+time=$(date +%Y-%m-%d_%H-%M-%S)
+
+# Permission to write to the log file
+sudo touch "$log_file" || { echo "Error: Unable to create log file."; exit 1; }
+sudo chmod 666 "$log_file" || { echo "Error: Unable to set log file permissions."; exit 1; }
+
+
+# Remove the temporary error file if it exists, and create a new one
+if [ -f "$tmp_error_file" ]; then
+    rm "$tmp_error_file"
+fi
+touch "$tmp_error_file" || { echo "Error: Unable to create temporary error file."; exit 1; }
+
+
+
+# ------- Functions -------
+
+# Log with timestamp
+log() {
+    local log_message="$1"
+    echo "$(date +"%Y-%m-%d %H:%M:%S"): $log_message" >>"$log_file"
+}
+
+# Error and exit
+error() {
+    echo "Error: $1"
+    log "Error: $1"
+    echo "$1" >>"$tmp_error_file"
+    exit 1
+}
+
+# Error and continue
+log_error() {
+    echo "Error: $1"
+    echo "$1" >>"$tmp_error_file"
+    log "Error: $1"
+}
+
+# Usage information
+usage() {
+    echo "Usage: backup [options] [directories]"
+    echo "Options:"
+    echo "  -o <output directory>    Specify the output directory"
+    echo "  -z                       Specify the compression type (gz, bz2, xz)"
+    echo "  -e                       Enable encryption (insert passphrase interactively)"
+    echo "  -k <encryption key>     Specify encryption key (used with -e)"
+    echo "  -r                       Remove the directory after backup"
+    echo "  -c                       Just copy the directory"
+    echo "  -p <number of cores>     Number of cores to use"
+    echo "  -l <log file>            Specify the log file"
+    echo "  -h                       Show this help message"
+    rm "$tmp_error_file"
+    exit 1
+}
+
+# Check if the output directory exists (Create it if it does not exist) and check if it is writable
+check_output_dir() {
+    if [ -z "$output_dir" ]; then
+        error "Output directory not specified"
+    fi
+
+    if [ ! -d "$output_dir" ]; then
+        mkdir $(pwd)/"$output_dir" || error "Failed to create output directory"
+    fi
+
+    if [ ! -w "$output_dir" ]; then
+        error "Output directory is not writable"
+    fi
+}
+
+#check log file
+check_log_file() {
+    if [ -z "$log_file" ]; then
+        echo "Log file not specified"
+        exit 1
+    fi
+
+    if [ ! -f "$log_file" ]; then
+        touch "$log_file" 2>/dev/null || { echo "Log file does not exist and cannot be created"; exit 1; }
+    fi
+
+    if [ ! -w "$log_file" ]; then
+        echo "Log file is not writable"
+        exit 1
+    fi
+}
+
+# Parse arguments
+while getopts "o:z:ek:rcp:l:h" opt; do
+    case $opt in
+    o) output_dir=$OPTARG
+        ;;
+    z) compression=$OPTARG
+        ;;
+    e) encrypt=true
+        ;;
+    k) encryption_key=$OPTARG
+        ;;
+    r) remove_after_backup=true ;;
+    c) just_copy=true ;;
+    p) num_cores=$OPTARG
+        # Check if the number of cores is a number and greater than 0
+        if ! [[ "$num_cores" =~ ^[0-9]+$ ]] || [ "$num_cores" -lt 1 ]; then
+            error "Number of cores must be a number and greater than 0"
+        fi
+        # Ensure that the number of cores is not greater than the number of cores available
+        if [ "$num_cores" -gt "$(nproc)" ]; then
+            error "Number of cores cannot be greater than the number of cores available ($(nproc))"
+        fi
+        ;;
+    l) log_file=$OPTARG
+        ;;
+    h) usage ;;
+    *) usage ;;
+    esac
+done
+
+
+check_output_dir
+
+check_log_file
+
+
+# Check if all tools are installed
+required_tools=("tar" "gpg" "awk" "sed" "du" "wait")
+missing_tools=()
+
+for tool in "${required_tools[@]}"; do
+    if ! command -v "$tool" &>/dev/null; then
+        missing_tools+=("$tool")
+    fi
+done
+
+# Error handling for missing tools
+if [ "${#missing_tools[@]}" -gt 0 ]; then
+    error "The following tools are required but not found: ${missing_tools[*]}"
+fi
+
+# Check for encryption key if -e is specified
+if [ "$encrypt" = true ] && [ -z "$encryption_key" ]; then
+    read -s -p "Enter encryption key: " encryption_key
+fi
+
+# Remove the parsed arguments
+shift $((OPTIND - 1))
+
+# Check if there are no arguments (directories)
+if [ $# -eq 0 ]; then
+    log_error "No directories specified"
+    usage
+fi
+
+# Check if the directory exists
+for dir in "$@"; do
+    if [ ! -d "$dir" ]; then
+        error "Directory $dir does not exist"
+    fi
+done
+
+directories=("$@")
+
+
+
+# ===== Backup functions =====
+
+# Backup by just copying the directory
+backup_copy() {
+    local output_directory="$output_dir/$time"
+    cp -r "$1" "$output_directory"
+
+    if [ $? -eq 0 ]; then
+        log "Copying done for $1"
+    else
+        error "Failed to copy $1"
+    fi
+}
+
+# Determine the compression type
+compressing_option="tar.gz"
+determine_compression() {
+    case "$compression" in
+    "gz") compressing_option="tar.gz" ;;
+    "bz2") compressing_option="tar.bz2" ;;
+    "xz") compressing_option="tar.xz" ;;
+    *) error "Compression type $compression is not supported" ;;
+    esac
+}
+
+# Backup by compressing the directory
+backup_compress() {
+    determine_compression
+    local output_directory="$2"
+
+    local dir_size=$(du -sh "$1" | awk '{print $1}')
+
+    local dir_name=$(echo "$1" | awk -F "/" '{print $NF}')
+
+    tar -cf "$output_directory/$dir_name.$compressing_option" "$1" 2>>"$log_file"
+
+    if [ $? -ne 0 ]; then
+        error "Failed to compress $1"
+    else
+        log "Compressing done for $1 ($dir_size)"
+    fi
+        
+
+    if [ "$encrypt" = true ]; then
+        echo "$encryption_key" | gpg --batch --passphrase-fd 0 -c "$output_directory/$dir_name.$compressing_option" 2>>"$log_file"
+        if [ $? -ne 0 ]; then
+            error "Failed to encrypt $1"
+        else
+            log "Encryption done for $1 ($dir_size)"
+        fi
+        
+        rm "$output_directory/$dir_name.$compressing_option"
+
+    fi
+
+    log "Backup done for $1 ($dir_size)"
+}
+
+# ---- Backup -----
+perform_backup() {
+    if [ "$just_copy" = true ]; then
+        backup_copy "$1" "$2"
+    else
+        backup_compress "$1" "$2"
+    fi
+
+    if [ "$remove_after_backup" = true ]; then
+        rm -rf "$1"
+        if [ $? -eq 0 ]; then
+            log "Removing done $1"
+        else
+            log_error "Failed to remove $1"
+        fi
+    fi
+}
+
+output_directory="$output_dir/$time"
+mkdir "$output_directory" || error "Failed to create output directory"
+
+# Parallel backup
+max_concurrent_jobs=$num_cores
+
+running_jobs=0
+
+for dir in "${directories[@]}"; do
+    while [[ $running_jobs -ge $max_concurrent_jobs ]]; do
+        wait -n
+        running_jobs=$((running_jobs - 1))
+    done
+
+    dir_name=$(echo "$dir" | awk -F "/" '{print $NF}')
+    log "Starting backup for $dir"
+    echo "Starting backup for $dir"
+    perform_backup "$dir" "$output_directory" &
+
+    running_jobs=$((running_jobs + 1))
+done
+
+wait
+
+
+
+# CHeck for the complete and uncompleted backups (errors) and print info about them
+printf "\nResults:\n"
+for dir in "${directories[@]}"; do
+     dir_name=$(echo "$dir" | awk -F "/" '{print $NF}')
+    if [ "$just_copy" = true ]; then
+        dir_to_check="$output_directory/$dir_name"
+
+        if [ -d "$dir_to_check" ]; then
+            echo "$dir: Success $(du -sh "$dir_to_check" | awk '{print $1  " (" $2 ")"}')"
+        else
+            echo "$dir: Failed"
+        fi
+    else
+        file_to_check="$output_directory/$dir_name.$compressing_option"
+
+        if [ "$encrypt" = true ]; then
+            file_to_check="$file_to_check.gpg"
+        fi
+
+        if [ -f "$file_to_check" ]; then
+            echo "$dir: Success $(du -sh "$file_to_check" | awk '{print $1  " (" $2 ")"}')"
+        else
+            echo "$dir: Failed"
+        fi
+    fi
+done
+
+
+# Check if there are any errors, if so, print them
+if [ -f "$tmp_error_file" ]; then
+    if [ -s "$tmp_error_file" ]; then
+        printf "\nErrors\n"
+        echo "There were errors during the backup, check the log file for more information"
+        cat "$tmp_error_file"
+
+        if [ -r $output_directory ]; then
+            rm -rf "$output_directory"
+        fi
+
+    fi
+    rm "$tmp_error_file"
+fi
+
+exit 0

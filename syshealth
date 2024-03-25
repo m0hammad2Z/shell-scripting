@@ -1,0 +1,276 @@
+#!/bin/bash
+
+# Function to handle errors
+function handle_error {
+  local exit_code="$1"
+  local message="$2"
+  echo "Error: $message"
+  log "Error: $message"
+  exit "$exit_code"
+}
+
+# Variables
+date=$(date +"%Y-%m-%d_%H-%M-%S")
+report="syshealth_$date.txt"
+log_file="/var/log/syshealth.log"
+all_checks=false
+check_cpu=false
+check_mem=false
+check_disk=false
+check_running_services=false
+check_last_update=false
+
+
+#check log file
+check_log_file() {
+    if [ -z "$log_file" ]; then
+        echo "Log file not specified"
+        exit 1
+    fi
+
+    if [ ! -f "$log_file" ]; then
+        (sudo touch "$log_file" 2>/dev/null && sudo chmod 666 "$log_file" 2>/dev/null)  || { echo "Log file does not exist and cannot be created"; exit 1; }
+    fi
+
+    if [ ! -w "$log_file" ]; then
+        echo "Log file is not writable"
+        exit 1
+    fi
+}
+
+# Options
+while getopts "acmdrul:" opt; do
+  case $opt in
+    a) all_checks=true ;;
+    c) check_cpu=true ;;
+    m) check_mem=true ;;
+    d) check_disk=true ;;
+    r) check_running_services=true ;;
+    u) check_last_update=true ;;
+    l) log_file="$OPTARG" ;;
+    *)
+      echo "Usage: syshealth [-a] [-c] [-m] [-d] [-r] [-u]"
+      exit 1
+      ;;
+  esac
+done
+
+
+check_log_file
+
+
+# Functions
+
+function print_section_title {
+  echo -e "\n===========  $1   ============\n" >> "$report"
+}
+
+function print_info {
+  echo "$1: $2" >> "$report"
+}
+
+function print_recommendation {
+  echo "Recommendation: $1" >> "$report"
+}
+
+function log {
+  echo "$(date +"%Y-%m-%d %H:%M:%S"): $1" >> "$log_file"
+}
+
+function system_details {
+  print_section_title "System Details"
+  print_info "Hostname" "$(hostname)"
+  print_info "Kernel Version" "$(uname -r)"
+  print_info "Architecture" "$(uname -m)"
+
+  if command -v lsb_release &> /dev/null; then
+    print_info "OS" "$(lsb_release -d 2>>"$log_file" | awk '{print $2 " " $3 " " $4}')"
+  else
+    print_info "OS" "Unknown"
+  fi
+
+  if command -v uptime &> /dev/null; then
+    print_info "Uptime" "$(uptime -p 2>>"$log_file" | awk '{print $2 " " $3 " " $4 " " $5 " " $6}')"
+  else
+    print_info "Uptime" "Unknown"
+  fi
+}
+
+function check_cpu_usage {
+  local cpu_usage=$(top -bn1 2>>"$log_file" | grep "Cpu(s)" | awk '{print int(100 - $8)}')
+
+  if [ -z "$cpu_usage" ]; then
+    log "Error: Unable to retrieve CPU usage information."
+    return 1
+  fi
+
+  print_section_title "CPU"
+  print_info "CPU Usage" "$cpu_usage%"
+
+  if [ "$cpu_usage" -gt 80 ]; then
+    print_info "CPU Usage Warning" "CPU usage is above 80%!"
+    print_recommendation "Consider optimizing or scaling resources for better performance."
+  else
+    print_info "CPU Usage: Normal"
+  fi
+}
+
+function check_memory_info {
+  local total_mem=$(free -m 2>>"$log_file" | awk '/^Mem:/ {print $2}')
+  local used_mem=$(free -m 2>>"$log_file" | awk '/^Mem:/ {print $3}')
+  local available_mem=$(free -m 2>>"$log_file" | awk '/^Mem:/ {print $7}')
+  local cached_mem=$(free -m 2>>"$log_file" | awk '/^Mem:/ {print $6}')
+
+  local total_swap=$(free -m 2>>"$log_file" | awk '/^Swap:/ {print $2}')
+  local used_swap=$(free -m 2>>"$log_file" | awk '/^Swap:/ {print $3}')
+  local free_swap=$(free -m 2>>"$log_file" | awk '/^Swap:/ {print $4}')
+
+  if [ -z "$total_mem" ] || [ -z "$used_mem" ] || [ -z "$available_mem" ] || [ -z "$cached_mem" ] || \
+     [ -z "$total_swap" ] || [ -z "$used_swap" ] || [ -z "$free_swap" ]; then
+    log "Error: Unable to retrieve memory information."
+    return 1
+  fi
+
+  print_section_title "Memory Information"
+  print_info "Total Memory" "$total_mem MB"
+  print_info "Used Memory" "$used_mem MB"
+  print_info "Available Memory" "$available_mem MB"
+  print_info "Cached Memory" "$cached_mem MB"
+
+  echo -e "\nSwap Memory Information" >> "$report"
+  print_info "Total Swap" "$total_swap MB"
+  print_info "Used Swap" "$used_swap MB"
+  print_info "Free Swap" "$free_swap MB"
+
+  if [ "$used_mem" -gt "$((total_mem / 2))" ]; then
+    print_info "Memory Usage Warning" "Used memory is more than 50% of total memory."
+    print_recommendation "Consider investigating and optimizing memory usage."
+    print_recommendation "See the processes section to see which processes are using the most memory."
+  else
+    print_info "Memory Usage: Normal"
+  fi
+}
+
+function check_processes {
+  local top_processes=$(ps aux --sort=-%cpu,-%mem | awk 'NR<=10 {printf "%-10s %-10s %-10s %-10s\n", $2, $3, $4, $11}')
+
+  if [ -z "$top_processes" ]; then
+    log "Error: Unable to retrieve processes information."
+    return 1
+  fi
+
+  print_section_title "Top Processes"
+  echo "$top_processes" >> "$report"
+}
+
+function check_disk_info {
+  local disk_partition="/dev/sda3"
+  local disk_usage=$(df -h "$disk_partition" 2>>"$log_file" | awk 'NR==2 {print $5}' | sed 's/%//')
+  local disk_total=$(df -h "$disk_partition" |2>>"$log_file"  awk 'NR==2 {print $2}')
+  local disk_used=$(df -h "$disk_partition" 2>>"$log_file" | awk 'NR==2 {print $3}')
+  local disk_available=$(df -h "$disk_partition" 2>>"$log_file" | awk 'NR==2 {print $4}')
+
+  if [ -z "$disk_usage" ] || [ -z "$disk_total" ] || [ -z "$disk_used" ] || [ -z "$disk_available" ]; then
+    log "Error: Unable to get disk information."
+    return 1
+  fi
+
+  print_section_title "Disk Information"
+  print_info "Disk Usage" "$disk_usage%"
+  print_info "Total Disk" "$disk_total"
+  print_info "Used Disk" "$disk_used"
+  print_info "Available Disk" "$disk_available"
+
+  if [ "$disk_usage" -gt 80 ]; then
+    print_info "Disk Usage Warning" "Disk usage is above 80%!"
+    print_recommendation "Consider freeing up space or expanding the disk capacity."
+  else
+    print_info "Disk Usage: Normal"
+  fi
+}
+
+function check_running_services_count {
+  local running_services=$(systemctl list-units --type=service --state=running  2>>"$log_file" | awk '{print $1}' | sed 's/\.service//g' | wc -l)
+
+  if [ -z "$running_services" ]; then
+    log "Error: Unable to get running services information."
+    return 1
+  fi
+
+  print_section_title "Running Services"
+  print_info "Number of Running Services" "$running_services"
+}
+
+function check_last_update_time {
+  local last_update_time=$(stat -c %y /var/log/apt/history.log 2>>"$log_file" | awk '{print $1 " " $2}')
+
+  if [ -z "$last_update_time" ]; then
+    log "Error: Unable to get last update time information."
+    return 1
+  fi
+
+  print_section_title "Last Update"
+  print_info "Last Update" "$last_update_time"
+}
+
+# Main
+
+# Check for required tools
+required_tools=("top" "free" "df" "systemctl" "uptime" "bc")
+for tool in "${required_tools[@]}"; do
+  command -v "$tool" &> /dev/null || handle_error 1 "$tool command not found"
+done
+
+# Check if any options were passed
+if [ "$#" -eq 0 ]; then
+  echo "Usage: syshealth [-a] [-c] [-m] [-d] [-r] [-u]"
+  handle_error 1 "No options were passed!"
+fi
+
+# Ensure the report file exists
+[ -f "$report" ] || touch "$report"
+
+# Logging start of script
+log "Syshealth script started."
+
+if [ "$all_checks" = false ]; then
+  if [ "$check_cpu" = true ]; then
+    check_cpu_usage || handle_error 3 "Unable to check CPU usage"
+    if [ ! "$check_mem" = true ]; then
+      check_processes || handle_error 5 "Unable to check processes information"
+    fi
+  fi
+
+  if [ "$check_mem" = true ]; then
+    check_memory_info || handle_error 4 "Unable to check memory information"
+    check_processes || handle_error 5 "Unable to check processes information"
+    
+  fi
+
+  if [ "$check_disk" = true ]; then
+    check_disk_info || handle_error 5 "Unable to check disk information"
+  fi
+
+  if [ "$check_running_services" = true ]; then
+    check_running_services_count || handle_error 6 "Unable to check running services information"
+  fi
+
+  if [ "$check_last_update" = true ]; then
+    check_last_update_time || handle_error 7 "Unable to check last update time information"
+  fi
+else
+  system_details
+  check_cpu_usage || handle_error 3 "Unable to check CPU usage"
+  check_memory_info || handle_error 4 "Unable to check memory information"
+  check_processes || handle_error 5 "Unable to check processes information"
+  check_disk_info || handle_error 6 "Unable to check disk information"
+  check_running_services_count || handle_error 7 "Unable to check running services information"
+  check_last_update_time || handle_error 8 "Unable to check last update time information"
+fi
+
+# Logging end of script
+log "Syshealth script completed."
+
+cat "$report"
+
+exit 0
