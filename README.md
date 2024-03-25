@@ -60,7 +60,7 @@ Task scheduling is crucial in system administration, ensuring critical processes
 
 * **Automating the Backup Script:** Regular backups can be automated by integrating the backup script into scheduled tasks. This ensures essential data is consistently backed up at specified intervals, providing data protection.
 
-  ## Conclusion
+## Conclusion
 
 Shell scripts offer powerful solutions for automating backup and system health operations on Linux systems. They provide flexibility, configurability, and performance improvements.
 
